@@ -12,11 +12,30 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import com.droiddeck.launcher.wayland.CompositorHost
+import com.droiddeck.launcher.wayland.WaylandCompositor
+
+interface GuestText {
+    fun commit(text: String)
+    fun preedit(text: String)
+}
+
+object CompositorText : GuestText {
+    override fun commit(text: String) {
+        if (CompositorHost.isStarted) WaylandCompositor.textInputCommit(text)
+    }
+
+    override fun preedit(text: String) {
+        if (CompositorHost.isStarted) WaylandCompositor.textInputPreedit(text, text.codePointCount(0, text.length))
+    }
+}
 
 class KeyboardHost(
     context: Context,
+    private val guestText: GuestText,
     private val sendKeyEvent: (KeyEvent) -> Boolean,
 ) : View(context) {
+    constructor(context: Context, sendKeyEvent: (KeyEvent) -> Boolean) : this(context, CompositorText, sendKeyEvent)
     constructor(activity: Activity) : this(activity, { activity.dispatchKeyEvent(it) })
 
     private val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -65,25 +84,64 @@ class KeyboardHost(
     }
 
     private inner class KeyConnection : BaseInputConnection(this, false) {
+        private var composing = ""
+
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            if (text.isNullOrEmpty()) return true
-            val events = map.getEvents(text.toString().toCharArray())
-            if (events != null) {
-                for (event in events) sendKeyEvent(event)
-            } else {
-                for (ch in text) {
-                    val t = System.currentTimeMillis()
-                    val down = KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN, 0, 0,
-                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, 0)
-                    sendKeyEvent(CharKeyEvent(down, ch))
-                    sendKeyEvent(CharKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP), ch))
-                }
+            val s = text?.toString().orEmpty()
+            val composed = composing.isNotEmpty()
+            composing = ""
+            val events = if (s.isEmpty()) null else map.getEvents(s.toCharArray())
+            if (events != null || s.isEmpty()) {
+                if (composed) guestText.preedit("")
+                events?.forEach { sendKeyEvent(it) }
+                return true
             }
+            if (composed && typable(s[0])) guestText.preedit("")
+            val run = StringBuilder()
+            for (ch in s) {
+                if (!typable(ch)) {
+                    run.append(ch)
+                    continue
+                }
+                if (run.isNotEmpty()) guestText.commit(run.toString())
+                run.clear()
+                typeChar(ch)
+            }
+            if (run.isNotEmpty()) guestText.commit(run.toString())
             return true
         }
 
-        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean = true
-        override fun finishComposingText(): Boolean = true
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            val s = text?.toString().orEmpty()
+            if (s == composing) return true
+            composing = s
+            guestText.preedit(s)
+            return true
+        }
+
+        override fun finishComposingText(): Boolean {
+            if (composing.isNotEmpty()) commitText(composing, 1)
+            return true
+        }
+
+        private fun typable(ch: Char): Boolean {
+            if (map.getEvents(charArrayOf(ch)) != null) return true
+            val plain = EvdevKeys.unshiftedChar(ch.code)
+            return EvdevKeys.keycodeForChar(if (plain != 0) plain else ch.code) != 0
+        }
+
+        private fun typeChar(ch: Char) {
+            val events = map.getEvents(charArrayOf(ch))
+            if (events != null) {
+                events.forEach { sendKeyEvent(it) }
+                return
+            }
+            val t = System.currentTimeMillis()
+            val down = KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN, 0, 0,
+                KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, 0)
+            sendKeyEvent(CharKeyEvent(down, ch))
+            sendKeyEvent(CharKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP), ch))
+        }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
             repeat(beforeLength) { tap(KeyEvent.KEYCODE_DEL) }
